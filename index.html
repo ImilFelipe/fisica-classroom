@@ -1270,6 +1270,9 @@
           </button>
         </div>
         <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button type="button" id="btnPegarTrabajoCarpetas" class="btn-ggb-outline-pill"
+            style="display: none; border-color: #0d9488; color: #0f766e; background: #f0fdfa;"
+            onclick="pegarTrabajoEnCarpetaActual()">📋 Pegar trabajo aquí</button>
           <button type="button" class="btn-ggb-outline-pill" onclick="abrirModalCrearCarpeta()">📁 + Nueva
             Carpeta</button>
           <button type="button" class="btn-ggb-outline-pill" onclick="registrarNuevaActividadHijaHtml()">🔬 + Vincular
@@ -1333,6 +1336,9 @@
         </div>
 
         <div style="display: flex; align-items: center; gap: 12px; position: relative; flex-wrap: wrap;">
+          <button type="button" id="btnPegarTrabajoMonitoreo" class="btn-action"
+            style="display: none; padding: 6px 12px; font-size: 0.82rem; background: #f0fdfa; color: #0f766e; border-color: #5eead4; border-radius: 10px; font-weight: 700;"
+            onclick="pegarTrabajoEnCarpetaActual()">📋 Pegar trabajo aquí</button>
           <span style="font-size: 0.85rem; font-weight: 700; color: #334155;">Código de Sala:</span>
           <span id="lblCodigoLeccionActiva"
             style="background: #0369a1; color: #ffffff; font-family: monospace; font-size: 1.15rem; font-weight: 800; letter-spacing: 2px; padding: 4px 14px; border-radius: 10px;">LEN1MD26</span>
@@ -1994,6 +2000,72 @@
       }, { merge: true }).catch(() => { });
     }
 
+    function limpiarObjetoParaFirestore(obj) {
+      try { return JSON.parse(JSON.stringify(obj)); } catch (e) { return null; }
+    }
+
+    function sincronizarTrabajoEnFirestore(trabajo) {
+      if (!dbFirestore || !trabajo || !trabajo.id) return Promise.resolve(false);
+      const docId = String(trabajo.id);
+      const payload = limpiarObjetoParaFirestore({
+        ...trabajo,
+        id: docId,
+        updatedAt: trabajo.updatedAt || Date.now()
+      });
+      if (!payload) return Promise.resolve(false);
+
+      const codSala = (trabajo.rawJson && trabajo.rawJson.codigoSala) || leccionGeneralConfig.codigoSala || 'GENERAL';
+      const docSala = normalizarCodigoSalaDoc(codSala);
+
+      const pGlobal = dbFirestore.collection('fisica_classroom_trabajos').doc(docId)
+        .set(payload, { merge: true }).catch(() => { });
+      const pSala = dbFirestore.collection('fisica_classroom_salas').doc(docSala)
+        .collection('trabajos_guardados').doc(docId)
+        .set(payload, { merge: true }).catch(() => { });
+
+      let pEquipo = Promise.resolve();
+      if (payload.rawJson && payload.rawJson.teamId) {
+        const equipoPatch = {
+          ...payload.rawJson,
+          carpeta: payload.carpeta || 'General',
+          nombreArchivo: payload.nombreArchivo || payload.integrantes,
+          timestamp: payload.updatedAt
+        };
+        pEquipo = dbFirestore.collection('fisica_classroom_salas').doc(docSala)
+          .collection('equipos').doc(String(payload.rawJson.teamId))
+          .set(equipoPatch, { merge: true }).catch(() => { });
+      }
+      return Promise.all([pGlobal, pSala, pEquipo]).then(() => true).catch(() => false);
+    }
+
+    async function cargarTrabajosGuardadosDesdeFirestore() {
+      if (!dbFirestore) return;
+      try {
+        const snap = await dbFirestore.collection('fisica_classroom_trabajos').get();
+        let huboCambios = false;
+        snap.forEach((doc) => {
+          const rem = doc.data();
+          if (!rem || !rem.id) return;
+          const idx = trabajosGuardados.findIndex(x => x && x.id === rem.id);
+          if (idx === -1) {
+            trabajosGuardados.push(rem);
+            huboCambios = true;
+          } else {
+            const loc = trabajosGuardados[idx];
+            if ((rem.updatedAt || 0) > (loc.updatedAt || 0)) {
+              trabajosGuardados[idx] = { ...loc, ...rem };
+              huboCambios = true;
+            }
+          }
+        });
+        if (huboCambios) {
+          deduplicarTrabajosGuardados();
+          guardarEstadoDocente();
+          if (modoDocenteActivo) programarRenderPanelDocente();
+        }
+      } catch (e) { }
+    }
+
     function enviarEquipoAFirestore(p) {
       if (!dbFirestore || !p || !p.teamId) return;
       const docSala = normalizarCodigoSalaDoc(p.codigoSala || leccionGeneralConfig.codigoSala);
@@ -2058,6 +2130,7 @@
         if (inicializarFirebaseNube()) {
           guardarSalaEnFirestore(leccionGeneralConfig);
           iniciarEscuchaFirestoreEnVivo(leccionGeneralConfig.codigoSala);
+          cargarTrabajosGuardadosDesdeFirestore();
           abrirModalConfigFirebase();
           alert('✅ Conectado a Firebase Firestore correctamente.');
         }
@@ -2104,20 +2177,44 @@
 
     let carpetasDocente = JSON.parse(localStorage.getItem('LAB_FISICA_CARPETAS_DOCENTE') || '[]');
     let trabajosGuardados = JSON.parse(localStorage.getItem('LAB_FISICA_TRABAJOS_GUARDADOS') || '[]');
+    let portapapelesTrabajoDocente = null;
+    let modalDetalleTrabGuardadoIdAbierto = null;
+
+    function obtenerNombreVisibleTrabajo(t) {
+      if (!t) return 'Trabajo sin nombre';
+      if (t.nombreArchivo && String(t.nombreArchivo).trim()) return String(t.nombreArchivo).trim();
+      if (t.integrantes && String(t.integrantes).trim()) return String(t.integrantes).trim();
+      const r = t.rawJson || {};
+      if (r.nombreArchivo && String(r.nombreArchivo).trim()) return String(r.nombreArchivo).trim();
+      if (r.student1) return [r.student1, r.student2, r.student3].filter(Boolean).join(' & ');
+      return r.integrantes || r.integrante1 || r.nombre || 'Estudiante';
+    }
+
+    function generarIdTrabajoUnico(idx = 0) {
+      let cand = '';
+      do {
+        cand = 'trab_' + Date.now() + '_' + idx + '_' + Math.random().toString(36).slice(2, 7);
+      } while (trabajosGuardados.some(x => x && x.id === cand));
+      return cand;
+    }
+
+    function esObjetoTrabajoValido(item) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+      return Boolean(
+        item.student1 || item.integrante1 || item.integrantes || item.nombre || item.nombreArchivo ||
+        item.actividadTitulo || item.titulo || item.curso || item.teamId || item.codigoVerificacion ||
+        (item.respuestas && typeof item.respuestas === 'object') ||
+        item.progreso != null
+      );
+    }
 
     function deduplicarTrabajosGuardados() {
       const mapa = new Map();
-      trabajosGuardados.forEach(t => {
+      trabajosGuardados.forEach((t, idx) => {
         if (!t) return;
-        const clave = (t.rawJson?.codigoVerificacion || t.rawJson?.teamId || `${(t.integrantes || '').toLowerCase().trim()}|${(t.actividadTitulo || '').toLowerCase().trim()}`);
+        const clave = t.id ? String(t.id) : `idx_${idx}`;
         if (!mapa.has(clave)) {
           mapa.set(clave, t);
-        } else {
-          const prev = mapa.get(clave);
-          // Priorizar el ejemplar que ya fue asignado a una carpeta específica distinta de 'General'
-          if ((prev.carpeta === 'General' || !prev.carpeta) && t.carpeta && t.carpeta !== 'General') {
-            mapa.set(clave, t);
-          }
         }
       });
       trabajosGuardados = Array.from(mapa.values());
@@ -2283,7 +2380,10 @@
       const codTrabajo = t.rawJson && t.rawJson.codigoSala ? normalizarCodigoSalaDoc(t.rawJson.codigoSala) : '';
       const codLec = normalizarCodigoSalaDoc(lec.codigoSala);
       if (codTrabajo) {
-        return codTrabajo === codLec;
+        if (codTrabajo === codLec) return true;
+        if ((leccionesEnMismaCarpeta || []).some(l => normalizarCodigoSalaDoc(l.codigoSala) === codTrabajo)) {
+          return false;
+        }
       }
       if (!leccionesEnMismaCarpeta || leccionesEnMismaCarpeta.length <= 1) {
         return true;
@@ -2327,7 +2427,7 @@
       const listaVivos = vivos.map(eq => ({
         id: eq.teamId,
         esVivo: true,
-        nombre: [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Equipo sin nombre',
+        nombre: (eq.nombreArchivo && String(eq.nombreArchivo).trim()) || [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Equipo sin nombre',
         curso: eq.curso || 'En sala activa',
         carpeta: eq.carpeta || carpetaLec || 'General',
         progreso: eq.progreso || 0,
@@ -2337,7 +2437,7 @@
       const listaGuardados = guardados.map(t => ({
         id: t.id,
         esVivo: false,
-        nombre: t.integrantes,
+        nombre: obtenerNombreVisibleTrabajo(t),
         curso: `${t.actividadTitulo} • ${t.curso}`,
         carpeta: t.carpeta || 'General',
         progreso: t.progreso != null ? t.progreso : 100,
@@ -2716,7 +2816,10 @@
       document.getElementById('teacherDashboard').style.display = 'block';
       cargarEquiposEnVivoPersistidos();
       actualizarBadgeEstadoNube();
-      if (firebaseConectado) iniciarEscuchaFirestoreEnVivo(leccionGeneralConfig.codigoSala);
+      if (firebaseConectado) {
+        iniciarEscuchaFirestoreEnVivo(leccionGeneralConfig.codigoSala);
+        cargarTrabajosGuardadosDesdeFirestore();
+      }
       iniciarEscuchaCloudRelayDocente(leccionGeneralConfig.codigoSala);
       cambiarVistaGgb('carpetas');
       renderizarPanelDocenteCompleto();
@@ -2775,6 +2878,7 @@
         document.getElementById('tabMonitoreo').classList.remove('active');
         document.getElementById('tabCarpetas').classList.add('active');
       }
+      if (typeof actualizarBotonesPegarTrabajo === 'function') actualizarBotonesPegarTrabajo();
     }
 
     function registrarNuevaActividadHijaHtml() {
@@ -2926,18 +3030,26 @@
               <span style="font-size:0.74rem; font-weight:800; padding:2px 9px; border-radius:999px; ${item.esVivo ? 'background:#dcfce7; color:#15803d;' : 'background:#f0fdfa; color:#0d9488; border:1px solid #99f6e4;'}">
                 ${item.esVivo ? '🟢 En vivo' : '💾 Trabajo guardado'}
               </span>
-              <div style="display:flex; align-items:center; gap:6px;">
-                <span style="font-size:0.74rem; font-weight:800; color:#0369a1; background:#e0f2fe; padding:2px 8px; border-radius:999px;" title="Carpeta donde está guardado">📁 ${escHtml(item.carpeta)}</span>
-                ${!item.esVivo ? `<button type="button" class="btn-action" style="padding:2px 7px; font-size:0.72rem;" onclick="moverTrabajoManual('${idJs}', event)" title="Cortar y pegar en otra carpeta">✂️ Mover</button>` : ''}
-              </div>
+              <span style="font-size:0.74rem; font-weight:800; color:#0369a1; background:#e0f2fe; padding:2px 8px; border-radius:999px;" title="Carpeta donde está guardado">📁 ${escHtml(item.carpeta)}</span>
             </div>
-            <div style="font-weight:800; font-size:1.06rem; color:#0f172a;">👤 ${escHtml(item.nombre)}</div>
+            <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:8px;">
+              <div style="font-weight:800; font-size:1.06rem; color:#0f172a; word-break:break-word;">👤 ${escHtml(item.nombre)}</div>
+              <button type="button" class="btn-action" style="padding:2px 8px; font-size:0.74rem; flex-shrink:0;" onclick="renombrarTrabajoEstudiante('${idJs}', event)" title="Renombrar archivo o trabajo del estudiante">✏️ Renombrar</button>
+            </div>
             <div style="font-size:0.82rem; color:#64748b; margin-top: 2px;">${escHtml(item.curso)}</div>
             <div style="margin-top: 12px;">
               <div style="display:flex; justify-content:space-between; font-size:0.8rem; font-weight:800; color:#0284c7;">
                 <span>Estado de Avance</span><span>${item.progreso}%</span>
               </div>
               <div class="student-progress-track"><div class="student-progress-fill" style="width: ${Math.min(100, Math.max(0, item.progreso))}%;"></div></div>
+            </div>
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:6px; margin-top:10px; padding-top:8px; border-top:1px dashed #e2e8f0; flex-wrap:wrap;" onclick="event.stopPropagation()">
+              <div style="display:flex; gap:5px; flex-wrap:wrap;">
+                <button type="button" class="btn-action" style="padding:3px 8px; font-size:0.72rem;" onclick="copiarTrabajoEstudiante('${idJs}', event)" title="Copiar trabajo para pegarlo en otra carpeta">📋 Copiar</button>
+                <button type="button" class="btn-action" style="padding:3px 8px; font-size:0.72rem;" onclick="cortarTrabajoEstudiante('${idJs}', event)" title="Cortar trabajo para moverlo a otra carpeta">✂️ Cortar</button>
+                <button type="button" class="btn-action" style="padding:3px 8px; font-size:0.72rem;" onclick="moverTrabajoManual('${idJs}', event)" title="Mover a otra carpeta">📁 Mover</button>
+              </div>
+              <button type="button" class="btn-action btn-file" style="padding:3px 8px; font-size:0.72rem;" onclick="exportarTrabajoEstudianteJSON('${idJs}', event)" title="Descargar .JSON con el nombre actualizado">📥 .JSON</button>
             </div>
           </div>
       `;
@@ -2947,6 +3059,7 @@
       grid.innerHTML = todosLosEstudiantes.length === 0
         ? `<div style="grid-column: 1 / -1; background: #ffffff; border: 1.5px dashed #cbd5e1; border-radius: 14px; padding: 28px; text-align: center; color: #64748b;">No hay estudiantes trabajando en vivo ni trabajos guardados en esta lección.</div>`
         : todosLosEstudiantes.map(renderTarjetaEstudianteHTML).join('');
+      actualizarBotonesPegarTrabajo();
     }
 
     function actualizarContenidoModalDetalleEquipo(eq) {
@@ -2957,7 +3070,8 @@
           <strong style="color:#0369a1;">${escHtml(k)}:</strong> <span style="color:#1e293b;">${escHtml(typeof v === 'object' ? JSON.stringify(v) : v)}</span>
         </div>
       `).join('');
-      const nombresEstudiantes = [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Estudiante';
+      const nombresEstudiantes = (eq.nombreArchivo && String(eq.nombreArchivo).trim()) || [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Estudiante';
+      const eqIdJs = escJsAttr(eq.teamId);
       const container = document.getElementById('modalDetailContent');
       if (!container) return;
       container.innerHTML = `
@@ -2967,13 +3081,16 @@
         </div>
         <p style="font-size: 0.95rem; color: #334155;"><strong>Curso:</strong> ${escHtml(eq.curso || 'No asignado')} • <strong>Avance:</strong> ${eq.progreso || 0}% • <strong>Salidas:</strong> ${eq.salidasDePestana || 0} • <strong>Última actividad:</strong> ${escHtml(eq.ultimaActividad || 'Ahora')}</p>
         ${filas ? `<div style="margin-top:12px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:10px; max-height:320px; overflow-y:auto;">${filas}</div>` : '<p style="color:#64748b; font-style:italic; margin-top:10px;">Sin respuestas registradas aún.</p>'}
-        <div style="margin-top: 20px; text-align:right;">
+        <div style="margin-top: 20px; display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap;">
+          <button type="button" class="btn-action" onclick="renombrarTrabajoEstudiante('${eqIdJs}', event)" style="padding: 10px 16px;">✏️ Renombrar</button>
+          <button type="button" class="btn-action btn-file" onclick="exportarTrabajoEstudianteJSON('${eqIdJs}', event)" style="padding: 10px 16px;">📥 Descargar .JSON</button>
           <button type="button" class="btn-action btn-save" onclick="cerrarModalDetalle()" style="padding: 10px 20px;">Cerrar Detalle</button>
         </div>
       `;
     }
 
     function abrirModalDetalleEquipo(teamId) {
+      modalDetalleTrabGuardadoIdAbierto = null;
       modalDetalleTeamIdAbierto = teamId;
       const eq = equiposEnMemoria.get(teamId);
       if (!eq) return;
@@ -2982,6 +3099,7 @@
     }
     function cerrarModalDetalle() {
       modalDetalleTeamIdAbierto = null;
+      modalDetalleTrabGuardadoIdAbierto = null;
       document.getElementById('modalDetalleEquipo').style.display = 'none';
     }
     function cerrarModalDetalleSiFondo(e) { if (e.target.id === 'modalDetalleEquipo') cerrarModalDetalle(); }
@@ -3209,10 +3327,25 @@
           const limp = nuevo.trim(), old = carp.nombre;
           carp.nombre = limp;
           carpetasDocente.forEach(c => { if (c.carpetaPadre === old) c.carpetaPadre = limp; });
-          trabajosGuardados.forEach(t => { if (t.carpeta === old) t.carpeta = limp; });
+          trabajosGuardados.forEach(t => {
+            if (t.carpeta === old) {
+              t.carpeta = limp;
+              t.updatedAt = Date.now();
+              if (t.rawJson && typeof t.rawJson === 'object') t.rawJson.carpeta = limp;
+              sincronizarTrabajoEnFirestore(t);
+            }
+          });
           actividadesMadre.forEach(a => { if (a.carpeta === old) a.carpeta = limp; });
-          if (leccionGeneralConfig && leccionGeneralConfig.carpeta === old) leccionGeneralConfig.carpeta = limp;
-          Object.values(mapaCodigosLeccion || {}).forEach(l => { if (l && l.carpeta === old) l.carpeta = limp; });
+          if (leccionGeneralConfig && leccionGeneralConfig.carpeta === old) {
+            leccionGeneralConfig.carpeta = limp;
+            guardarSalaEnFirestore(leccionGeneralConfig);
+          }
+          Object.values(mapaCodigosLeccion || {}).forEach(l => {
+            if (l && l.carpeta === old) {
+              l.carpeta = limp;
+              guardarSalaEnFirestore(l);
+            }
+          });
           if (carpetaActivaNombre === old) carpetaActivaNombre = limp;
           guardarEstadoDocente(); renderizarPanelDocenteCompleto();
         }
@@ -3232,7 +3365,14 @@
         if (confirm(`¿Eliminar la carpeta "${carp.nombre}"?`)) {
           const padreDestino = carp.carpetaPadre || 'General';
           carpetasDocente.forEach(c => { if (c.carpetaPadre === carp.nombre) c.carpetaPadre = padreDestino; });
-          trabajosGuardados.forEach(t => { if (t.carpeta === carp.nombre) t.carpeta = 'General'; });
+          trabajosGuardados.forEach(t => {
+            if (t.carpeta === carp.nombre) {
+              t.carpeta = 'General';
+              t.updatedAt = Date.now();
+              if (t.rawJson && typeof t.rawJson === 'object') t.rawJson.carpeta = 'General';
+              sincronizarTrabajoEnFirestore(t);
+            }
+          });
           actividadesMadre.forEach(a => { if (a.carpeta === carp.nombre) a.carpeta = 'General'; });
           if (leccionGeneralConfig && leccionGeneralConfig.carpeta === carp.nombre) leccionGeneralConfig.carpeta = 'General';
           Object.values(mapaCodigosLeccion || {}).forEach(l => { if (l && l.carpeta === carp.nombre) l.carpeta = 'General'; });
@@ -3292,7 +3432,7 @@
       if (sueltos.todos.length > 0) {
         const carpEsc = escJsAttr(carpetaVista);
         cardsHtml += `
-          <div class="leccion-unica-card" onclick="abrirMonitoreoCarpetaSolo('${carpEsc}')">
+          <div class="leccion-unica-card" draggable="true" ondragstart="iniciarDragItem(event, 'trabajos_carpeta', '${carpEsc}')" onclick="abrirMonitoreoCarpetaSolo('${carpEsc}')">
             <div class="ggb-activity-thumb" style="height: 110px; background: linear-gradient(135deg, #ecfeff 0%, #dcfce7 100%);">
               <div style="font-size: 2.3rem; line-height: 1;">📂</div>
               <span style="font-size: 0.75rem; font-weight: 800; color: #0f766e; background: rgba(255,255,255,0.92); padding: 2px 12px; border-radius: 999px;">📁 ${escHtml(carpetaVista)} • Trabajos Importados</span>
@@ -3314,21 +3454,277 @@
       container.innerHTML = cardsHtml;
     }
 
+    function archivarEquipoVivoATrabajo(eq, destino) {
+      if (!eq) return null;
+      const lecEq = eq.codigoSala ? buscarLeccionPorCodigo(eq.codigoSala) : null;
+      const nombreVisible = (eq.nombreArchivo && String(eq.nombreArchivo).trim()) ||
+        [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Estudiante';
+      const trabajo = {
+        id: generarIdTrabajoUnico(),
+        nombreArchivo: nombreVisible,
+        integrantes: nombreVisible,
+        curso: eq.curso || 'Laboratorio de Física',
+        actividadTitulo: eq.actividadTitulo || (lecEq ? lecEq.titulo : leccionGeneralConfig.titulo),
+        progreso: eq.progreso || 0,
+        carpeta: destino || 'General',
+        fecha: new Date().toLocaleDateString('es-CL'),
+        updatedAt: Date.now(),
+        rawJson: { ...eq, carpeta: destino || 'General', nombreArchivo: nombreVisible }
+      };
+      trabajosGuardados.unshift(trabajo);
+      equiposEnMemoria.delete(eq.teamId);
+      guardarEquiposEnVivoPersistidos();
+      return trabajo;
+    }
+
+    function asignarCarpetaATrabajo(t, destino) {
+      if (!t) return;
+      t.carpeta = destino;
+      t.updatedAt = Date.now();
+      if (t.rawJson && typeof t.rawJson === 'object') {
+        t.rawJson.carpeta = destino;
+      }
+      sincronizarTrabajoEnFirestore(t);
+    }
+
+    function asegurarCarpetaDocente(nombreCarpeta) {
+      if (!nombreCarpeta) return;
+      const norm = nombreCarpeta.trim();
+      if (!norm || norm.toLowerCase() === 'general') return;
+      if (!carpetasDocente.some(c => c.nombre.toLowerCase() === norm.toLowerCase())) {
+        carpetasDocente.push({ id: 'carp_' + Date.now(), nombre: norm, carpetaPadre: carpetaActivaNombre || 'General' });
+      }
+    }
+
     function moverTrabajoManual(trabId, event) {
       if (event) event.stopPropagation();
       const t = trabajosGuardados.find(x => x.id === trabId);
-      if (!t) return;
+      const eq = !t ? equiposEnMemoria.get(trabId) : null;
+      if (!t && !eq) return;
+      const nombreActual = t ? obtenerNombreVisibleTrabajo(t) : ((eq.nombreArchivo && String(eq.nombreArchivo).trim()) || [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Estudiante');
+      const carpetaActual = (t ? t.carpeta : eq.carpeta) || 'General';
       const nombresCarpetas = ['General', ...carpetasDocente.map(c => c.nombre)].join(', ');
-      const dest = prompt(`✂️ Cortar y pegar trabajo de "${t.integrantes}".\nCarpetas disponibles: ${nombresCarpetas}\n\nEscribe el nombre de la carpeta destino:`, t.carpeta || 'General');
+      const dest = prompt(`📁 Mover trabajo de "${nombreActual}".\nCarpetas disponibles: ${nombresCarpetas}\n\nEscribe el nombre de la carpeta destino:`, carpetaActual);
       if (dest && dest.trim()) {
         const limp = dest.trim();
-        t.carpeta = limp;
-        if (limp.toLowerCase() !== 'general' && !carpetasDocente.some(c => c.nombre.toLowerCase() === limp.toLowerCase())) {
-          carpetasDocente.push({ id: 'carp_' + Date.now(), nombre: limp, carpetaPadre: carpetaActivaNombre || 'General' });
+        asegurarCarpetaDocente(limp);
+        if (t) {
+          asignarCarpetaATrabajo(t, limp);
+        } else if (eq) {
+          const nuevoTrab = archivarEquipoVivoATrabajo(eq, limp);
+          if (nuevoTrab) sincronizarTrabajoEnFirestore(nuevoTrab);
         }
         guardarEstadoDocente();
         renderizarPanelDocenteCompleto();
+        mostrarToast(`📁 Trabajo movido a "${limp}" y sincronizado con Firebase.`);
       }
+    }
+
+    function actualizarBotonesPegarTrabajo() {
+      const btnCarp = document.getElementById('btnPegarTrabajoCarpetas');
+      const btnMon = document.getElementById('btnPegarTrabajoMonitoreo');
+      const activo = Boolean(portapapelesTrabajoDocente);
+      const destino = obtenerCarpetaDestinoActiva();
+      const accionTxt = portapapelesTrabajoDocente && portapapelesTrabajoDocente.modo === 'cortar' ? 'Mover aquí' : 'Pegar copia';
+      const nombreCorto = portapapelesTrabajoDocente ? String(portapapelesTrabajoDocente.nombre || '').slice(0, 26) : '';
+      const label = activo ? `📋 ${accionTxt}: "${nombreCorto}" → 📁 ${destino}` : '📋 Pegar trabajo aquí';
+
+      [btnCarp, btnMon].forEach(btn => {
+        if (!btn) return;
+        btn.style.display = activo ? 'inline-flex' : 'none';
+        btn.textContent = label;
+      });
+    }
+
+    function copiarTrabajoEstudiante(trabId, event) {
+      if (event) event.stopPropagation();
+      const t = trabajosGuardados.find(x => x.id === trabId);
+      const eq = !t ? equiposEnMemoria.get(trabId) : null;
+      if (!t && !eq) return;
+      const nombre = t ? obtenerNombreVisibleTrabajo(t) : ((eq.nombreArchivo && String(eq.nombreArchivo).trim()) || [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Estudiante');
+      portapapelesTrabajoDocente = { modo: 'copiar', id: trabId, esVivo: Boolean(eq), nombre };
+      actualizarBotonesPegarTrabajo();
+      mostrarToast(`📋 Trabajo "${nombre}" copiado. Abre una carpeta y presiona "Pegar" o Ctrl+V.`);
+    }
+
+    function cortarTrabajoEstudiante(trabId, event) {
+      if (event) event.stopPropagation();
+      const t = trabajosGuardados.find(x => x.id === trabId);
+      const eq = !t ? equiposEnMemoria.get(trabId) : null;
+      if (!t && !eq) return;
+      const nombre = t ? obtenerNombreVisibleTrabajo(t) : ((eq.nombreArchivo && String(eq.nombreArchivo).trim()) || [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Estudiante');
+      portapapelesTrabajoDocente = { modo: 'cortar', id: trabId, esVivo: Boolean(eq), nombre };
+      actualizarBotonesPegarTrabajo();
+      mostrarToast(`✂️ Trabajo "${nombre}" cortado. Abre la carpeta destino y presiona "Pegar" o Ctrl+V.`);
+    }
+
+    function pegarTrabajoEnCarpetaActual(carpetaDestinoOpcional, event) {
+      if (event) event.stopPropagation();
+      if (!portapapelesTrabajoDocente) {
+        mostrarToast('ℹ️ Primero copia o corta un trabajo para poder pegarlo.');
+        return false;
+      }
+      const destino = (carpetaDestinoOpcional && String(carpetaDestinoOpcional).trim()) || obtenerCarpetaDestinoActiva() || 'General';
+      asegurarCarpetaDocente(destino);
+
+      const srcId = portapapelesTrabajoDocente.id;
+      const modo = portapapelesTrabajoDocente.modo;
+      const tOrig = trabajosGuardados.find(x => x.id === srcId);
+      const eqOrig = !tOrig ? equiposEnMemoria.get(srcId) : null;
+
+      if (!tOrig && !eqOrig) {
+        portapapelesTrabajoDocente = null;
+        actualizarBotonesPegarTrabajo();
+        mostrarToast('⚠️ El trabajo original ya no está disponible.');
+        return false;
+      }
+
+      if (modo === 'cortar') {
+        if (tOrig) {
+          asignarCarpetaATrabajo(tOrig, destino);
+        } else if (eqOrig) {
+          const nuevo = archivarEquipoVivoATrabajo(eqOrig, destino);
+          if (nuevo) sincronizarTrabajoEnFirestore(nuevo);
+        }
+        portapapelesTrabajoDocente = null;
+        guardarEstadoDocente();
+        renderizarPanelDocenteCompleto();
+        mostrarToast(`✅ Trabajo movido a 📁 "${destino}" y sincronizado con Firebase.`);
+        return true;
+      }
+
+      // Modo copiar: crear clon independiente con nuevo ID y nombre claro
+      const baseTrab = tOrig || {
+        nombreArchivo: (eqOrig.nombreArchivo && String(eqOrig.nombreArchivo).trim()) || [eqOrig.student1, eqOrig.student2, eqOrig.student3].filter(Boolean).join(' & ') || 'Estudiante',
+        integrantes: [eqOrig.student1, eqOrig.student2, eqOrig.student3].filter(Boolean).join(' & ') || 'Estudiante',
+        curso: eqOrig.curso || 'Laboratorio de Física',
+        actividadTitulo: eqOrig.actividadTitulo || leccionGeneralConfig.titulo || 'Entrega de Laboratorio',
+        progreso: eqOrig.progreso != null ? Number(eqOrig.progreso) : 0,
+        carpeta: eqOrig.carpeta || 'General',
+        fecha: new Date().toLocaleDateString('es-CL'),
+        rawJson: { ...eqOrig }
+      };
+
+      const nombreOrig = obtenerNombreVisibleTrabajo(baseTrab);
+      const mismaCarpeta = (baseTrab.carpeta || 'General') === destino;
+      const nombreCopia = mismaCarpeta ? `${nombreOrig} (Copia)` : nombreOrig;
+      const nuevoId = generarIdTrabajoUnico();
+      const rawClon = limpiarObjetoParaFirestore(baseTrab.rawJson || {}) || {};
+      rawClon.carpeta = destino;
+      rawClon.nombreArchivo = nombreCopia;
+      rawClon.integrantes = nombreCopia;
+      rawClon.nombre = nombreCopia;
+      if (rawClon.teamId) {
+        rawClon.teamId = `team_copy_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      }
+      if (!rawClon.student2 && !rawClon.student3) {
+        rawClon.student1 = nombreCopia;
+        rawClon.integrante1 = nombreCopia;
+      }
+
+      const copia = {
+        ...baseTrab,
+        id: nuevoId,
+        nombreArchivo: nombreCopia,
+        integrantes: nombreCopia,
+        carpeta: destino,
+        updatedAt: Date.now(),
+        rawJson: rawClon
+      };
+      trabajosGuardados.unshift(copia);
+      sincronizarTrabajoEnFirestore(copia);
+      guardarEstadoDocente();
+      renderizarPanelDocenteCompleto();
+      mostrarToast(`📋 Copia de "${nombreCopia}" pegada en 📁 "${destino}" y guardada en Firebase.`);
+      return true;
+    }
+
+    function renombrarTrabajoEstudiante(trabId, event) {
+      if (event) event.stopPropagation();
+      const t = trabajosGuardados.find(x => x.id === trabId);
+      const eq = !t ? equiposEnMemoria.get(trabId) : null;
+      if (!t && !eq) return false;
+
+      const nombreActual = t
+        ? obtenerNombreVisibleTrabajo(t)
+        : ((eq.nombreArchivo && String(eq.nombreArchivo).trim()) || [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Estudiante');
+      const respuestaPrompt = prompt('✏️ Nuevo nombre para el archivo / trabajo del estudiante:', nombreActual);
+      if (!respuestaPrompt || !respuestaPrompt.trim()) return false;
+
+      const nuevoNombre = respuestaPrompt.trim();
+      if (nuevoNombre === nombreActual) return false;
+
+      if (t) {
+        t.nombreArchivo = nuevoNombre;
+        t.integrantes = nuevoNombre;
+        t.updatedAt = Date.now();
+        t.rawJson = (t.rawJson && typeof t.rawJson === 'object') ? { ...t.rawJson } : {};
+        t.rawJson.nombreArchivo = nuevoNombre;
+        t.rawJson.integrantes = nuevoNombre;
+        t.rawJson.nombre = nuevoNombre;
+        if (!t.rawJson.student2 && !t.rawJson.student3) {
+          t.rawJson.student1 = nuevoNombre;
+          t.rawJson.integrante1 = nuevoNombre;
+        }
+        sincronizarTrabajoEnFirestore(t);
+        guardarEstadoDocente();
+        renderizarPanelDocenteCompleto();
+        if (modalDetalleTrabGuardadoIdAbierto === t.id) {
+          verDetalleTrabajoGuardado(t.id);
+        }
+      } else if (eq) {
+        eq.nombreArchivo = nuevoNombre;
+        eq.student1 = nuevoNombre;
+        eq.integrante1 = nuevoNombre;
+        eq.student2 = '';
+        eq.student3 = '';
+        eq.integrante2 = '';
+        eq.timestamp = Date.now();
+        guardarEquiposEnVivoPersistidos();
+        enviarEquipoAFirestore(eq);
+        renderizarPanelDocenteCompleto();
+        if (modalDetalleTeamIdAbierto === eq.teamId) {
+          actualizarContenidoModalDetalleEquipo(eq);
+        }
+      }
+      mostrarToast(`✏️ Archivo renombrado a "${nuevoNombre}" y sincronizado con Firebase.`);
+      return true;
+    }
+
+    function exportarTrabajoEstudianteJSON(trabId, event) {
+      if (event) event.stopPropagation();
+      const t = trabajosGuardados.find(x => x.id === trabId);
+      const eq = !t ? equiposEnMemoria.get(trabId) : null;
+      const src = t || eq;
+      if (!src) return;
+
+      const nombreVis = t
+        ? obtenerNombreVisibleTrabajo(t)
+        : ((eq.nombreArchivo && String(eq.nombreArchivo).trim()) || [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & ') || 'Estudiante');
+      const baseJson = t ? { ...(t.rawJson || {}) } : { ...eq };
+      baseJson.nombreArchivo = nombreVis;
+      baseJson.integrantes = nombreVis;
+      baseJson.nombre = nombreVis;
+      if (!baseJson.student2 && !baseJson.student3) {
+        baseJson.student1 = nombreVis;
+        baseJson.integrante1 = nombreVis;
+      }
+      baseJson.actividadTitulo = baseJson.actividadTitulo || (t ? t.actividadTitulo : '');
+      baseJson.curso = baseJson.curso || (t ? t.curso : '');
+      baseJson.carpeta = (t ? t.carpeta : eq.carpeta) || 'General';
+      baseJson.progreso = t ? t.progreso : (eq.progreso || 0);
+
+      const blob = new Blob([JSON.stringify(baseJson, null, 2)], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const slug = nombreVis.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') || 'trabajo_estudiante';
+      a.href = url;
+      a.download = `${slug}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      mostrarToast(`📥 Descargado "${slug}.json".`);
     }
 
     function toggleMenuLeccionGeneral(id, ev) {
@@ -3396,7 +3792,7 @@
           trabajosGuardados.forEach(t => {
             const codT = t.rawJson && t.rawJson.codigoSala ? normalizarCodigoSalaDoc(t.rawJson.codigoSala) : '';
             if ((t.carpeta || 'General') === orig && (codT ? codT === codNorm : (t.actividadTitulo || '') === (lec.titulo || ''))) {
-              t.carpeta = limp;
+              asignarCarpetaATrabajo(t, limp);
             }
           });
           guardarSalaEnFirestore(lec);
@@ -3433,21 +3829,51 @@
       event.dataTransfer.setData('text/plain', JSON.stringify({ tipo, id }));
       event.dataTransfer.effectAllowed = 'move';
     }
-    function permitirDropCarpeta(event) { event.preventDefault(); event.currentTarget.classList.add('drag-over'); }
+    function permitirDropCarpeta(event) {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      event.currentTarget.classList.add('drag-over');
+    }
     function salirDropCarpeta(event) { event.currentTarget.classList.remove('drag-over'); }
     function soltarEnCarpeta(event, destino) {
       event.preventDefault(); event.stopPropagation(); event.currentTarget.classList.remove('drag-over');
       if (event.dataTransfer.files?.length > 0) return procesarArchivosTrabajos(event.dataTransfer.files, destino);
       try {
         const p = JSON.parse(event.dataTransfer.getData('text/plain'));
-        if (p.tipo === 'trabajo') { const t = trabajosGuardados.find(x => x.id === p.id); if (t) t.carpeta = destino; }
+        if (p.tipo === 'trabajo') {
+          const t = trabajosGuardados.find(x => x.id === p.id);
+          if (t) {
+            asignarCarpetaATrabajo(t, destino);
+            mostrarToast(`📁 Trabajo movido a "${destino}" y guardado en Firebase.`);
+          }
+        }
         else if (p.tipo === 'actividad') { const a = actividadesMadre.find(x => x.id === p.id); if (a) a.carpeta = destino; }
         else if (p.tipo === 'leccion_general') {
           const lec = (p.id && p.id !== 'general') ? buscarLeccionPorCodigo(p.id) : leccionGeneralConfig;
           if (lec) {
+            const orig = lec.carpeta || 'General';
+            const codNorm = normalizarCodigoSalaDoc(lec.codigoSala);
             lec.carpeta = destino;
             actualizarRegistroLeccionEnMapa(lec);
+            trabajosGuardados.forEach(t => {
+              const codT = t.rawJson && t.rawJson.codigoSala ? normalizarCodigoSalaDoc(t.rawJson.codigoSala) : '';
+              if ((t.carpeta || 'General') === orig && (codT ? codT === codNorm : (t.actividadTitulo || '') === (lec.titulo || ''))) {
+                asignarCarpetaATrabajo(t, destino);
+              }
+            });
             guardarSalaEnFirestore(lec);
+          }
+        }
+        else if (p.tipo === 'trabajos_carpeta') {
+          const carpOrig = p.id || 'General';
+          if (carpOrig !== destino) {
+            const lecEnOrig = obtenerListaLeccionesActivas().filter(l => (l.carpeta || 'General') === carpOrig);
+            trabajosGuardados.forEach(t => {
+              if ((t.carpeta || 'General') === carpOrig && !lecEnOrig.some(l => trabajoPerteneceALeccion(t, l, lecEnOrig))) {
+                asignarCarpetaATrabajo(t, destino);
+              }
+            });
+            mostrarToast(`📁 Trabajos movidos a "${destino}" y guardados en Firebase.`);
           }
         }
         else if (p.tipo === 'carpeta') {
@@ -3464,85 +3890,274 @@
         else if (p.tipo === 'equipo_vivo') {
           const eq = equiposEnMemoria.get(p.id);
           if (eq) {
-            const lecEq = eq.codigoSala ? buscarLeccionPorCodigo(eq.codigoSala) : null;
-            trabajosGuardados.unshift({ id: 'trab_' + Date.now(), integrantes: [eq.student1, eq.student2, eq.student3].filter(Boolean).join(' & '), curso: eq.curso, actividadTitulo: eq.actividadTitulo || (lecEq ? lecEq.titulo : leccionGeneralConfig.titulo), progreso: eq.progreso || 0, carpeta: destino, fecha: new Date().toLocaleDateString('es-CL'), rawJson: eq });
-            equiposEnMemoria.delete(p.id);
-            guardarEquiposEnVivoPersistidos();
+            const nuevoTrab = archivarEquipoVivoATrabajo(eq, destino);
+            if (nuevoTrab) sincronizarTrabajoEnFirestore(nuevoTrab);
+            mostrarToast(`📁 Trabajo guardado en "${destino}" y sincronizado con Firebase.`);
           }
         }
         guardarEstadoDocente(); renderizarPanelDocenteCompleto();
       } catch (e) { }
     }
 
+    function obtenerCarpetaDestinoActiva() {
+      const vMon = document.getElementById('vistaMonitoreo');
+      const enMonitoreo = vMon && vMon.style && vMon.style.display === 'block';
+      if (enMonitoreo) {
+        if (vistaMonitoreoCarpetaSolo) return vistaMonitoreoCarpetaSolo;
+        if (leccionGeneralConfig && !leccionGeneralConfig.eliminada && leccionGeneralConfig.carpeta) {
+          return leccionGeneralConfig.carpeta;
+        }
+      }
+      return carpetaActivaNombre || 'General';
+    }
+
     function permitirDropZonaTrabajos(ev) { ev.preventDefault(); ev.currentTarget.classList.add('drag-over'); }
     function salirDropZonaTrabajos(ev) { ev.currentTarget.classList.remove('drag-over'); }
     function soltarArchivosEnZonaTrabajos(ev) {
       ev.preventDefault(); ev.currentTarget.classList.remove('drag-over');
-      if (ev.dataTransfer.files?.length > 0) procesarArchivosTrabajos(ev.dataTransfer.files, carpetaActivaNombre || 'General');
+      if (ev.dataTransfer.files?.length > 0) procesarArchivosTrabajos(ev.dataTransfer.files, obtenerCarpetaDestinoActiva());
     }
     function cargarTrabajosPorInput(ev) {
-      if (ev.target.files?.length > 0) { procesarArchivosTrabajos(ev.target.files, carpetaActivaNombre || 'General'); ev.target.value = ''; }
+      if (ev.target.files?.length > 0) { procesarArchivosTrabajos(ev.target.files, obtenerCarpetaDestinoActiva()); ev.target.value = ''; }
+    }
+
+    function generarNombreNoDuplicado(base, carpeta) {
+      let cand = base;
+      let n = 2;
+      const existeNombre = (nom) => trabajosGuardados.some(x =>
+        x && (x.carpeta || 'General') === carpeta && obtenerNombreVisibleTrabajo(x).toLowerCase() === nom.toLowerCase()
+      );
+      while (existeNombre(cand)) {
+        cand = `${base} (${n})`;
+        n++;
+      }
+      return cand;
     }
 
     function importarListaTrabajosJSON(items, carpetaDestino, tituloDef) {
+      const resumen = { agregados: 0, reemplazados: 0, invalidos: 0, trabajosProcesados: [] };
+      if (!Array.isArray(items)) {
+        resumen.invalidos = 1;
+        return resumen;
+      }
+
       items.forEach((item, idx) => {
-        if (!item || typeof item !== 'object') return;
-        const integrantes = item.student1
-          ? [item.student1, item.student2, item.student3].filter(Boolean).join(' & ')
-          : (item.integrantes || item.nombre || `Estudiante ${idx + 1}`);
+        if (!esObjetoTrabajoValido(item)) {
+          resumen.invalidos++;
+          return;
+        }
         const carpetaAsignada = carpetaDestino || item.carpeta || 'General';
-        trabajosGuardados.unshift({
-          id: 'trab_' + Date.now() + '_' + idx + '_' + Math.random().toString(36).slice(2, 6),
-          integrantes,
-          curso: item.curso || 'Laboratorio de Física',
-          actividadTitulo: item.actividadTitulo || item.titulo || tituloDef || 'Entrega de Laboratorio',
-          progreso: item.progreso != null ? Number(item.progreso) : 100,
-          carpeta: carpetaAsignada,
-          fecha: item.fecha || new Date().toLocaleDateString('es-CL'),
-          rawJson: { ...item, carpeta: carpetaAsignada }
+        const nombreBase = (
+          (item.nombreArchivo && String(item.nombreArchivo).trim()) ||
+          (item.student1 ? [item.student1, item.student2, item.student3].filter(Boolean).join(' & ') : '') ||
+          item.integrante1 || item.integrantes || item.nombre || `Estudiante ${idx + 1}`
+        ).trim();
+        const titExplicito = (item.actividadTitulo || item.titulo || '').trim().toLowerCase();
+        const titAct = (item.actividadTitulo || item.titulo || tituloDef || 'Entrega de Laboratorio').trim();
+
+        const idxMismoNombre = trabajosGuardados.findIndex(x => {
+          if (!x || (x.carpeta || 'General') !== carpetaAsignada) return false;
+          if (obtenerNombreVisibleTrabajo(x).toLowerCase() !== nombreBase.toLowerCase()) return false;
+          const xTitExp = (x.rawJson && (x.rawJson.actividadTitulo || x.rawJson.titulo) || '').trim().toLowerCase();
+          if (titExplicito && xTitExp) return titExplicito === xTitExp;
+          return true;
         });
+        const idxMismoIdEnCarpeta = (item.id && idxMismoNombre < 0)
+          ? trabajosGuardados.findIndex(x => x && x.id === item.id && (x.carpeta || 'General') === carpetaAsignada)
+          : -1;
+        const idxConflicto = idxMismoNombre >= 0 ? idxMismoNombre : idxMismoIdEnCarpeta;
+
+        if (idxConflicto >= 0) {
+          const reemplazar = confirm(
+            `Ya existe un trabajo de "${nombreBase}" en la carpeta "${carpetaAsignada}".\n\n` +
+            `¿Deseas REEMPLAZARLO con este archivo?\n(Aceptar = Reemplazar | Cancelar = Conservar ambos con un nuevo ID)`
+          );
+          if (reemplazar) {
+            const actual = trabajosGuardados[idxConflicto];
+            const actualizado = {
+              ...actual,
+              nombreArchivo: nombreBase,
+              integrantes: nombreBase,
+              curso: item.curso || actual.curso || 'Laboratorio de Física',
+              actividadTitulo: titAct,
+              progreso: item.progreso != null ? Number(item.progreso) : actual.progreso,
+              carpeta: carpetaDestino || item.carpeta || 'General',
+              fecha: item.fecha || new Date().toLocaleDateString('es-CL'),
+              updatedAt: Date.now(),
+              rawJson: {
+                ...item,
+                carpeta: carpetaDestino || item.carpeta || 'General',
+                nombreArchivo: nombreBase,
+                integrantes: nombreBase,
+                teamId: (actual.rawJson && actual.rawJson.teamId) || item.teamId
+              }
+            };
+            trabajosGuardados[idxConflicto] = actualizado;
+            resumen.reemplazados++;
+            resumen.trabajosProcesados.push(actualizado);
+            sincronizarTrabajoEnFirestore(actualizado);
+            return;
+          }
+        }
+
+        const hayColisionNombre = idxConflicto >= 0 || trabajosGuardados.some(x =>
+          x && (x.carpeta || 'General') === carpetaAsignada &&
+          obtenerNombreVisibleTrabajo(x).toLowerCase() === nombreBase.toLowerCase()
+        );
+        const nombreFinal = hayColisionNombre ? generarNombreNoDuplicado(nombreBase, carpetaAsignada) : nombreBase;
+        const nuevoId = generarIdTrabajoUnico(idx);
+        const rawLimpio = {
+          ...item,
+          carpeta: carpetaDestino || item.carpeta || 'General',
+          nombreArchivo: nombreFinal,
+          integrantes: nombreFinal,
+          nombre: nombreFinal
+        };
+        if (rawLimpio.teamId && trabajosGuardados.some(x => x && x.rawJson && x.rawJson.teamId === rawLimpio.teamId)) {
+          rawLimpio.teamId = `team_imp_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+        }
+        if (rawLimpio.codigoVerificacion && hayColisionNombre) {
+          rawLimpio.codigoVerificacion = `${rawLimpio.codigoVerificacion}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+        }
+
+        const nuevoTrab = {
+          id: nuevoId,
+          nombreArchivo: nombreFinal,
+          integrantes: nombreFinal,
+          curso: item.curso || 'Laboratorio de Física',
+          actividadTitulo: titAct,
+          progreso: item.progreso != null ? Number(item.progreso) : 100,
+          carpeta: carpetaDestino || item.carpeta || 'General',
+          fecha: item.fecha || new Date().toLocaleDateString('es-CL'),
+          updatedAt: Date.now(),
+          rawJson: rawLimpio
+        };
+        trabajosGuardados.unshift(nuevoTrab);
+        resumen.agregados++;
+        resumen.trabajosProcesados.push(nuevoTrab);
+        sincronizarTrabajoEnFirestore(nuevoTrab);
       });
+
       deduplicarTrabajosGuardados();
+      return resumen;
     }
 
     function procesarArchivosTrabajos(fileList, carpetaDestino) {
-      Array.from(fileList).forEach(file => {
-        if (!file.name.toLowerCase().endsWith('.json')) return;
+      const archivos = Array.from(fileList || []);
+      const archivosJson = archivos.filter(f => f && f.name && f.name.toLowerCase().endsWith('.json'));
+      const destino = carpetaDestino || obtenerCarpetaDestinoActiva() || 'General';
+
+      if (archivosJson.length === 0) {
+        mostrarToast('⚠️ Selecciona al menos un archivo en formato .json válido.');
+        return;
+      }
+
+      let pendientes = archivosJson.length;
+      let totalAgregados = 0;
+      let totalReemplazados = 0;
+      let erroresFormato = 0;
+      let ultimoErrorMsg = '';
+
+      const finalizarLote = () => {
+        if (pendientes > 0) return;
+        const totalOk = totalAgregados + totalReemplazados;
+        if (totalOk > 0) {
+          guardarEstadoDocente();
+          renderizarPanelDocenteCompleto();
+          const partes = [];
+          if (totalAgregados > 0) partes.push(`${totalAgregados} agregado(s)`);
+          if (totalReemplazados > 0) partes.push(`${totalReemplazados} reemplazado(s)`);
+          mostrarToast(`✅ ${partes.join(', ')} en 📁 "${destino}" y guardado(s) en Firebase.`);
+        } else if (erroresFormato > 0) {
+          mostrarToast(ultimoErrorMsg || '⚠️ Ningún archivo pudo importarse: revisa que el formato .json sea válido.');
+        }
+      };
+
+      archivosJson.forEach(file => {
         const r = new FileReader();
         r.onload = (e) => {
           try {
             const json = JSON.parse(e.target.result);
-            const arr = Array.isArray(json) ? json : (json.trabajosEstudiantes || json.trabajos || json.estudiantes || [json]);
-            importarListaTrabajosJSON(arr, carpetaDestino, json.titulo || file.name.replace(/\.json$/i, ''));
-            guardarEstadoDocente();
-            renderizarPanelDocenteCompleto();
-          } catch (err) { alert(`El archivo "${file.name}" no es un JSON válido.`); }
+            if (!json || typeof json !== 'object') throw new Error('JSON vacío o inválido');
+            const arr = Array.isArray(json)
+              ? json
+              : (Array.isArray(json.trabajosEstudiantes) ? json.trabajosEstudiantes
+                : (Array.isArray(json.trabajos) ? json.trabajos
+                  : (Array.isArray(json.estudiantes) ? json.estudiantes : [json])));
+
+            if (!arr.length || !arr.some(esObjetoTrabajoValido)) {
+              erroresFormato++;
+              ultimoErrorMsg = `⚠️ "${file.name}" no tiene estructura de trabajo de estudiante.`;
+              mostrarToast(ultimoErrorMsg);
+            } else {
+              const res = importarListaTrabajosJSON(arr, destino, json.titulo || file.name.replace(/\.json$/i, ''));
+              totalAgregados += res.agregados;
+              totalReemplazados += res.reemplazados;
+              if (res.invalidos > 0 && res.agregados === 0 && res.reemplazados === 0) {
+                erroresFormato++;
+                ultimoErrorMsg = `⚠️ "${file.name}" no contiene entregas válidas.`;
+              }
+            }
+          } catch (err) {
+            erroresFormato++;
+            ultimoErrorMsg = `❌ Error de formato en "${file.name}": no es un JSON válido.`;
+            mostrarToast(ultimoErrorMsg);
+          } finally {
+            pendientes--;
+            finalizarLote();
+          }
+        };
+        r.onerror = () => {
+          erroresFormato++;
+          pendientes--;
+          finalizarLote();
         };
         r.readAsText(file);
       });
     }
 
+    window.iniciarDragItem = iniciarDragItem;
+    window.permitirDropCarpeta = permitirDropCarpeta;
+    window.salirDropCarpeta = salirDropCarpeta;
+    window.soltarEnCarpeta = soltarEnCarpeta;
     window.permitirDropZonaTrabajos = permitirDropZonaTrabajos;
     window.salirDropZonaTrabajos = salirDropZonaTrabajos;
     window.soltarArchivosEnZonaTrabajos = soltarArchivosEnZonaTrabajos;
     window.cargarTrabajosPorInput = cargarTrabajosPorInput;
     window.importarListaTrabajosJSON = importarListaTrabajosJSON;
     window.procesarArchivosTrabajos = procesarArchivosTrabajos;
+    window.copiarTrabajoEstudiante = copiarTrabajoEstudiante;
+    window.cortarTrabajoEstudiante = cortarTrabajoEstudiante;
+    window.pegarTrabajoEnCarpetaActual = pegarTrabajoEnCarpetaActual;
+    window.moverTrabajoManual = moverTrabajoManual;
+    window.renombrarTrabajoEstudiante = renombrarTrabajoEstudiante;
+    window.exportarTrabajoEstudianteJSON = exportarTrabajoEstudianteJSON;
 
     function verDetalleTrabajoGuardado(trabId) {
       const t = trabajosGuardados.find(x => x.id === trabId);
       if (!t) return;
+      modalDetalleTeamIdAbierto = null;
+      modalDetalleTrabGuardadoIdAbierto = t.id;
+      const nombreVis = obtenerNombreVisibleTrabajo(t);
+      const idJs = escJsAttr(t.id);
       const resp = t.rawJson?.respuestas || {};
       const filas = Object.entries(resp).map(([k, v]) => `<div style="padding:6px 10px; border-bottom:1px solid #e2e8f0; font-size:0.86rem;"><strong style="color:#0369a1;">${escHtml(k)}:</strong> ${escHtml(typeof v === 'object' ? JSON.stringify(v) : v)}</div>`).join('');
       document.getElementById('modalDetailContent').innerHTML = `
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; border-bottom:1.5px solid #e2e8f0; padding-bottom:10px;">
-          <h3 style="font-family:var(--font-heading); font-size:1.35rem; margin:0;">📄 Trabajo Guardado</h3>
+          <h3 style="font-family:var(--font-heading); font-size:1.35rem; margin:0;">📄 ${escHtml(nombreVis)}</h3>
           <button type="button" onclick="cerrarModalDetalle()" style="background:none; border:none; font-size:1.4rem; cursor:pointer;">✕</button>
         </div>
-        <p><strong>Estudiantes:</strong> ${escHtml(t.integrantes)}</p>
+        <p><strong>Archivo / Estudiante:</strong> ${escHtml(nombreVis)} • <strong>Carpeta:</strong> 📁 ${escHtml(t.carpeta || 'General')}</p>
         <p><strong>Curso:</strong> ${escHtml(t.curso)} • <strong>Avance:</strong> ${t.progreso}% • <strong>Fecha:</strong> ${escHtml(t.fecha)}</p>
         ${filas ? `<div style="margin-top:12px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:10px; max-height:280px; overflow-y:auto;">${filas}</div>` : ''}
-        <div style="text-align:right; margin-top:16px;"><button type="button" class="btn-action btn-save" onclick="cerrarModalDetalle()">Cerrar</button></div>
+        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:16px; flex-wrap:wrap;">
+          <button type="button" class="btn-action" onclick="renombrarTrabajoEstudiante('${idJs}', event)">✏️ Renombrar</button>
+          <button type="button" class="btn-action" onclick="copiarTrabajoEstudiante('${idJs}', event)">📋 Copiar</button>
+          <button type="button" class="btn-action" onclick="cortarTrabajoEstudiante('${idJs}', event)">✂️ Cortar</button>
+          <button type="button" class="btn-action" onclick="moverTrabajoManual('${idJs}', event)">📁 Mover</button>
+          <button type="button" class="btn-action btn-file" onclick="exportarTrabajoEstudianteJSON('${idJs}', event)">📥 Descargar .JSON</button>
+          <button type="button" class="btn-action btn-save" onclick="cerrarModalDetalle()">Cerrar</button>
+        </div>
       `;
       document.getElementById('modalDetalleEquipo').style.display = 'flex';
     }
@@ -3634,8 +4249,16 @@
       if (!modoDocenteActivo) e.preventDefault();
     });
     document.addEventListener('keydown', (e) => {
-      if (modoDocenteActivo) return;
       const key = (e.key || '').toLowerCase();
+      if (modoDocenteActivo) {
+        const tag = (document.activeElement && document.activeElement.tagName) || '';
+        const editable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || Boolean(document.activeElement && document.activeElement.isContentEditable);
+        if (!editable && (e.ctrlKey || e.metaKey) && key === 'v' && portapapelesTrabajoDocente) {
+          e.preventDefault();
+          pegarTrabajoEnCarpetaActual();
+        }
+        return;
+      }
       if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && (key === 'i' || key === 'j' || key === 'c')) || (e.ctrlKey && key === 'u')) {
         e.preventDefault();
       }
